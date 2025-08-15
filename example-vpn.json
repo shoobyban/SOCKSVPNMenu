@@ -1,0 +1,31 @@
+{
+  "autossh_path": "/opt/homebrew/bin/autossh",
+  "local_port": 1234,
+  "interface": "Wi-Fi",
+  "server_options": {
+    "server_alive_interval": 10,
+    "server_alive_count_max": 3
+  },
+  "commands": [
+    {
+      "name": "on",
+      "description": "Connect to UK server",
+      "server": "uk"
+    },
+    {
+      "name": "us", 
+      "description": "Connect to US server",
+      "server": "demo"
+    },
+    {
+      "name": "ms",
+      "description": "Connect to MS server", 
+      "server": "ademo"
+    },
+    {
+      "name": "gc",
+      "description": "Connect to GC server",
+      "server": "gc"
+    }
+  ]
+}
