@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,13 +9,14 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
 )
 
-// Config represents the VPN configuration structure
+// Config: VPN configuration
 type Config struct {
 	AutoSSHPath   string        `json:"autossh_path"`
 	LocalPort     int           `json:"local_port"`
@@ -23,13 +25,13 @@ type Config struct {
 	Commands      []Command     `json:"commands"`
 }
 
-// ServerOptions represents SSH connection options
+// ServerOptions: SSH keepalive options
 type ServerOptions struct {
 	ServerAliveInterval int `json:"server_alive_interval"`
 	ServerAliveCountMax int `json:"server_alive_count_max"`
 }
 
-// Command represents a VPN command configuration
+// Command: a named VPN server entry
 type Command struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -62,18 +64,14 @@ func main() {
 }
 
 func (app *VPNApp) onReady() {
-	// Create menu items first so we have references to menu items (eg. Disconnect)
+	// build menu, then set initial icon and start a periodic refresh
 	systray.SetTooltip("SOCKS VPN Menu")
 	app.buildMenu()
-
-	// After menu is created, update icon/state to reflect current VPN status
 	app.updateIcon()
 
-	// Start a ticker to update status periodically
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-
 		for range ticker.C {
 			app.updateIcon()
 		}
@@ -86,9 +84,7 @@ func (app *VPNApp) onExit() {
 }
 
 func (app *VPNApp) buildMenu() {
-	// Note: Status is displayed in the status bar icon only (via systray.SetTitle)
-	// The menu itself does not contain a status line to avoid duplication.
-	// ...existing code continues below
+	// Status is shown in the menu bar icon; keep the menu minimal.
 
 	// Add VPN commands
 	for _, cmd := range app.config.Commands {
@@ -112,7 +108,7 @@ func (app *VPNApp) buildMenu() {
 		systray.AddSeparator()
 	}
 
-	// Disconnect button
+	// Disconnect
 	app.disconnectItem = systray.AddMenuItem("Disconnect", "Disconnect from VPN")
 	if !app.isVPNConnected() {
 		app.disconnectItem.Disable()
@@ -120,20 +116,36 @@ func (app *VPNApp) buildMenu() {
 	go func() {
 		for {
 			<-app.disconnectItem.ClickedCh
+
+			// Disable the item while disconnecting to avoid repeated clicks
+			app.disconnectItem.Disable()
+
 			err := app.disconnectVPN()
 			if err != nil {
 				log.Printf("Error disconnecting: %v", err)
-			} else {
-				log.Printf("Disconnected")
-				app.updateIcon()
-				// Note: Cannot rebuild menu dynamically with this systray version
+				// Re-enable so user can retry
+				app.disconnectItem.Enable()
+				continue
 			}
+
+			// Wait for autossh to actually exit and for the SOCKS port to close.
+			// Poll several times over ~5 seconds.
+			for i := 0; i < 20; i++ {
+				if !app.isVPNConnected() {
+					break
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+
+			log.Printf("Disconnected (or timed out waiting for process to exit)")
+			app.updateIcon()
+			// Leave the disconnect item disabled when disconnected
 		}
 	}()
 
 	systray.AddSeparator()
 
-	// Edit Configuration button
+	// Edit configuration
 	editConfigItem := systray.AddMenuItem("⚙️ Edit Configuration", "Edit VPN configuration file")
 	go func() {
 		for {
@@ -147,7 +159,7 @@ func (app *VPNApp) buildMenu() {
 
 	systray.AddSeparator()
 
-	// Quit button
+	// Quit
 	quitItem := systray.AddMenuItem("Quit", "Quit the application")
 	go func() {
 		<-quitItem.ClickedCh
@@ -156,21 +168,21 @@ func (app *VPNApp) buildMenu() {
 }
 
 func (app *VPNApp) updateIcon() {
-	// Try to set a real icon from the app Resources first. If that fails,
-	// fall back to a small emoji title so the status bar still shows state.
+	// Compute connection state once to avoid races and repeated expensive calls
+	connected := app.isVPNConnected()
+
+	// Prefer bundled image icons; otherwise use emoji titles
 	usr, _ := user.Current()
 	resourcesDir := filepath.Join(usr.HomeDir, "") // default empty; when bundled, resources will be bundled in the app package
 
 	// Try to load icon from known relative path inside app bundle Resources
-	// When running inside the .app bundle created by build script, the resources are located at
-	// <App>.app/Contents/Resources/connected.png and disconnected.png
 	exePath, err := os.Executable()
 	var baseDir string
 	if err == nil {
 		baseDir = filepath.Dir(exePath)
 	}
 
-	// Attempt to locate Resources directory
+	// Check common Resources locations
 	resourcesCandidates := []string{
 		filepath.Join(baseDir, "../Resources"), // when running from Contents/MacOS
 		filepath.Join(baseDir, "Resources"),    // when running from project dir
@@ -184,16 +196,18 @@ func (app *VPNApp) updateIcon() {
 			continue
 		}
 		var iconPath string
-		if app.isVPNConnected() {
+		if connected {
 			iconPath = filepath.Join(rdir, "connected.png")
 			tooltip := "SOCKS VPN Menu - Connected"
 			if iconBytes, err := os.ReadFile(iconPath); err == nil {
+				// Use image icon and clear title
 				systray.SetIcon(iconBytes)
+				systray.SetTitle("")
 				systray.SetTooltip(tooltip)
 				iconSet = true
 				break
 			}
-			// fallback to emoji title if icon not found
+			// fallback to emoji
 			systray.SetTitle("🌎")
 			systray.SetTooltip(tooltip)
 			iconSet = true
@@ -203,10 +217,12 @@ func (app *VPNApp) updateIcon() {
 			tooltip := "SOCKS VPN Menu - Disconnected"
 			if iconBytes, err := os.ReadFile(iconPath); err == nil {
 				systray.SetIcon(iconBytes)
+				systray.SetTitle("")
 				systray.SetTooltip(tooltip)
 				iconSet = true
 				break
 			}
+			// fallback to emoji
 			systray.SetTitle("🌐")
 			systray.SetTooltip(tooltip)
 			iconSet = true
@@ -215,25 +231,19 @@ func (app *VPNApp) updateIcon() {
 	}
 
 	if !iconSet {
-		// As a final fallback, use emoji titles
-		if app.isVPNConnected() {
+		// final fallback: emoji titles
+		if connected {
 			systray.SetTitle("🌎")
 			systray.SetTooltip("SOCKS VPN Menu - Connected")
-			if app.disconnectItem != nil {
-				app.disconnectItem.Enable()
-			}
 		} else {
 			systray.SetTitle("🌐")
 			systray.SetTooltip("SOCKS VPN Menu - Disconnected")
-			if app.disconnectItem != nil {
-				app.disconnectItem.Disable()
-			}
 		}
 	}
 
-	// Ensure disconnect menu item matches current status if icons were set above
+	// Sync disconnect menu state
 	if app.disconnectItem != nil {
-		if app.isVPNConnected() {
+		if connected {
 			app.disconnectItem.Enable()
 		} else {
 			app.disconnectItem.Disable()
@@ -279,36 +289,51 @@ func (app *VPNApp) loadConfig() (*Config, error) {
 }
 
 func (app *VPNApp) isVPNConnected() bool {
-	// Method 1: Check if autossh process is running
+	// Method 1: Check for autossh process with -D flag
 	cmd := exec.Command("pgrep", "-f", "autossh.*-D.*localhost")
 	output, err := cmd.Output()
-
-	if err == nil && len(output) > 0 {
-		// Found autossh process with SOCKS proxy (-D flag)
-		log.Printf("VPN connected: autossh process detected")
+	if err == nil && len(bytes.TrimSpace(output)) > 0 {
+		log.Printf("VPN connected: autossh process detected (with -D)")
 		return true
 	}
 
-	// Method 2: Fallback to simple autossh check
+	// Method 2: Fallback to any autossh process
 	cmd2 := exec.Command("pgrep", "autossh")
-	err2 := cmd2.Run()
-
-	if err2 == nil {
-		log.Printf("VPN connected: autossh process detected (fallback method)")
+	if err2 := cmd2.Run(); err2 == nil {
+		log.Printf("VPN connected: autossh process detected (fallback)")
 		return true
 	}
 
-	// Method 3: Check if SOCKS proxy is active on our port
+	// Method 3: look for a TCP LISTEN on the configured local port from ssh/autossh
 	if app.config != nil && app.config.LocalPort > 0 {
-		cmd3 := exec.Command("lsof", "-i", fmt.Sprintf(":%d", app.config.LocalPort))
-		err3 := cmd3.Run()
-		if err3 == nil {
-			log.Printf("VPN connected: SOCKS proxy port %d is active", app.config.LocalPort)
-			return true
+		// Use -nP and LISTEN to avoid TIME_WAIT/ESTABLISHED matches
+		lsofCmd := exec.Command("lsof", "-nP", fmt.Sprintf("-iTCP:%d", app.config.LocalPort), "-sTCP:LISTEN")
+		out3, err3 := lsofCmd.Output()
+		if err3 == nil && len(bytes.TrimSpace(out3)) > 0 {
+			// Inspect lines (skip header) for ssh/autossh in the COMMAND column
+			text := strings.TrimSpace(string(out3))
+			lines := strings.Split(text, "\n")
+			if len(lines) > 1 {
+				for _, ln := range lines[1:] {
+					lower := strings.ToLower(ln)
+					if strings.Contains(lower, "autossh") || strings.Contains(lower, "ssh") {
+						log.Printf("VPN connected: lsof shows SSH listener: %s", strings.TrimSpace(ln))
+						return true
+					}
+				}
+			}
+			// listener found but not ssh; ignore
+			log.Printf("lsof reports listener on port %d but not SSH: %q", app.config.LocalPort, text)
+			return false
 		}
 	}
 
-	log.Printf("VPN disconnected: no autossh process or SOCKS proxy detected")
+	log.Printf("VPN disconnected: no autossh process or SSH listener on port %d", func() int {
+		if app.config != nil {
+			return app.config.LocalPort
+		}
+		return 0
+	}())
 	return false
 }
 
@@ -325,7 +350,7 @@ func (app *VPNApp) connectVPN(commandName string) error {
 		return fmt.Errorf("command '%s' not found in configuration", commandName)
 	}
 
-	// First disconnect any existing connection
+	// Disconnect any existing connection first
 	app.disconnectVPN()
 
 	// Build autossh command
@@ -342,7 +367,7 @@ func (app *VPNApp) connectVPN(commandName string) error {
 		return fmt.Errorf("failed to start autossh: %w", err)
 	}
 
-	// Set up SOCKS proxy
+	// Enable SOCKS proxy via networksetup
 	proxyCmd := exec.Command("networksetup", "-setsocksfirewallproxy", app.config.Interface, "127.0.0.1", fmt.Sprintf("%d", app.config.LocalPort))
 	if err := proxyCmd.Run(); err != nil {
 		return fmt.Errorf("failed to set SOCKS proxy: %w", err)
@@ -352,7 +377,7 @@ func (app *VPNApp) connectVPN(commandName string) error {
 }
 
 func (app *VPNApp) disconnectVPN() error {
-	// Disable SOCKS proxy
+	// Turn off SOCKS proxy
 	proxyCmd := exec.Command("networksetup", "-setsocksfirewallproxystate", app.config.Interface, "off")
 	if err := proxyCmd.Run(); err != nil {
 		log.Printf("Warning: failed to disable SOCKS proxy: %v", err)
@@ -361,23 +386,33 @@ func (app *VPNApp) disconnectVPN() error {
 	// Kill autossh processes
 	killCmd := exec.Command("pkill", "autossh")
 	if err := killCmd.Run(); err != nil {
-		// pkill returns non-zero exit code if no processes found, which is not an error
 		if exitError, ok := err.(*exec.ExitError); ok {
 			if status, ok := exitError.Sys().(syscall.WaitStatus); ok && status.ExitStatus() == 1 {
 				// No processes found - this is fine
 				return nil
-			} else {
-				return fmt.Errorf("failed to kill autossh processes: %w", err)
 			}
+			log.Printf("pkill returned error: %v", err)
 		} else {
-			return fmt.Errorf("failed to kill autossh processes: %w", err)
+			log.Printf("pkill failed: %v", err)
+		}
+	}
+
+	// If autossh persists after pkill, try SIGKILL
+	checkCmd := exec.Command("pgrep", "autossh")
+	if err := checkCmd.Run(); err == nil {
+		// autossh still present; attempt SIGKILL
+		log.Printf("autossh processes still present after pkill, issuing SIGKILL")
+		kill9 := exec.Command("pkill", "-9", "autossh")
+		if err := kill9.Run(); err != nil {
+			log.Printf("SIGKILL attempt failed: %v", err)
+			// Give up but don't return fatal error; the caller will poll and update status
 		}
 	}
 
 	return nil
 }
 
-// editConfiguration opens the VPN configuration file in the default editor
+// editConfiguration opens ~/.vpn.json in an editor (creates a dummy if missing)
 func (app *VPNApp) editConfiguration() error {
 	usr, err := user.Current()
 	if err != nil {
